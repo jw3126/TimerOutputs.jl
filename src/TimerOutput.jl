@@ -5,15 +5,48 @@ mutable struct TimeData
     ncalls::Int
     time::Int64
     allocs::Int64
+    # copied from gcdiff
+    allocd      ::Int64 # Bytes allocated
+    malloc      ::Int64 # Number of GC aware malloc()
+    realloc     ::Int64 # Number of GC aware realloc()
+    poolalloc   ::Int64 # Number of pool allocation
+    bigalloc    ::Int64 # Number of big (non-pool) allocation
+    freecall    ::Int64 # Number of GC aware free()
+    total_time  ::Int64 # Time spent in garbage collection
+    pause       ::Int64 # Number of GC pauses
+    full_sweep  ::Int64 # Number of GC full collection
 end
 
-Base.copy(td::TimeData) = TimeData(td.ncalls, td.time, td.allocs)
-TimeData() = TimeData(0, 0, 0)
+Base.copy(td::TimeData) = TimeData(td.ncalls,
+                                   td.time,
+                                   td.allocs      ,
+                                   td.allocd      ,
+                                   td.malloc      ,
+                                   td.realloc     ,
+                                   td.poolalloc   ,
+                                   td.bigalloc    ,
+                                   td.freecall    ,
+                                   td.total_time  ,
+                                   td.pause       ,
+                                   td.full_sweep  ,
+                                )
+TimeData() = TimeData(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
 function Base.:+(self::TimeData, other::TimeData)
-    TimeData(self.ncalls + other.ncalls,
-             self.time + other.time,
-             self.allocs + other.allocs)
+    TimeData(
+        self.ncalls      + other.ncalls      ,
+        self.time        + other.time        ,
+        self.allocs      + other.allocs      ,
+        self.allocd      + other.allocd      ,
+        self.malloc      + other.malloc      ,
+        self.realloc     + other.realloc     ,
+        self.poolalloc   + other.poolalloc   ,
+        self.bigalloc    + other.bigalloc    ,
+        self.freecall    + other.freecall    ,
+        self.total_time  + other.total_time  ,
+        self.pause       + other.pause       ,
+        self.full_sweep  + other.full_sweep  ,
+   )
 end
 
 ###############
@@ -31,7 +64,8 @@ mutable struct TimerOutput
     prev_timer::TimerOutput
 
     function TimerOutput(label::String = "root")
-        start_data = TimeData(0, time_ns(), gc_bytes())
+        start_data = TimeData()
+        start_data.time = time_ns()
         accumulated_data = TimeData()
         inner_timers = Dict{String,TimerOutput}()
         timer_stack = TimerOutput[]
@@ -209,16 +243,29 @@ function timer_expr_func(m::Module, is_debug::Bool, to, expr::Expr)
     end
 end
 
-function do_accumulate!(accumulated_data, t₀, b₀)
-    accumulated_data.time += time_ns() - t₀
-    accumulated_data.allocs += gc_bytes() - b₀
+function do_accumulate!(accumulated_data, t0, b0)
+    t1 = time_ns()
+    b1 = Base.gc_num()
+    d = Base.GC_Diff(b1, b0)
+    accumulated_data.time += t1 - t0
+    accumulated_data.allocs += d.allocd # TODO
     accumulated_data.ncalls += 1
+    accumulated_data.allocd      += d.allocd    
+    accumulated_data.malloc      += d.malloc    
+    accumulated_data.realloc     += d.realloc   
+    accumulated_data.poolalloc   += d.poolalloc 
+    accumulated_data.bigalloc    += d.bigalloc  
+    accumulated_data.freecall    += d.freecall  
+    accumulated_data.total_time  += d.total_time
+    accumulated_data.pause       += d.pause     
+    accumulated_data.full_sweep  += d.full_sweep
 end
 
 function timer_expr(m::Module, is_debug::Bool, to::Union{Symbol,Expr}, label, ex::Expr)
     timeit_block = quote
         local accumulated_data = $(push!)($(esc(to)), $(esc(label)))
-        local b₀ = $(gc_bytes)()
+        # local b₀ = $(gc_bytes)()
+        local b₀ = $(Base.gc_num)()
         local t₀ = $(time_ns)()
         local val
         $(Expr(:tryfinally,
@@ -246,7 +293,8 @@ end
 reset_timer!() = reset_timer!(DEFAULT_TIMER)
 function reset_timer!(to::TimerOutput)
     to.inner_timers = Dict{String,TimerOutput}()
-    to.start_data = TimeData(0, time_ns(), gc_bytes())
+    to.start_data = TimeData()
+    to.start_data.time = time_ns()
     to.accumulated_data = TimeData()
     to.prev_timer_label = ""
     resize!(to.timer_stack, 0)
@@ -255,18 +303,16 @@ end
 
 # We can remove this now that the @timeit macro is exception safe.
 # Doesn't hurt to keep it for a while though
-timeit(f::Function, label::String) = timeit(f, DEFAULT_TIMER, label)
+# timeit(f::Function, label::String) = timeit(f, DEFAULT_TIMER, label)
 function timeit(f::Function, to::TimerOutput, label::String)
     accumulated_data = push!(to, label)
-    b₀ = gc_bytes()
-    t₀ = time_ns()
+    b0 = Base.gc_num()
+    t0 = time_ns()
     local val
     try
         val = f()
     finally
-        accumulated_data.time += time_ns() - t₀
-        accumulated_data.allocs += gc_bytes() - b₀
-        accumulated_data.ncalls += 1
+        do_accumulate!(accumulated_data, t0, b0)
         pop!(to)
     end
     return val
